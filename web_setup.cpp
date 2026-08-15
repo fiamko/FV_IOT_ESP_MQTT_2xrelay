@@ -116,11 +116,11 @@ static String generate_html(const char* message = nullptr) {
     h += F("'>"
 
            "<label>Prodleva přepsání [s]:</label>"
-           "<input name='override_delay' type='number' min='2' max='8' value='");
+           "<input name='override_delay' type='number' min='0' max='300' value='");
     h += String(g_settings.override_delay);
     h += F("'>"
 
-           "<label>Web heslo (NENI predvyplneno):</label>"
+           "<label>Web heslo:</label>"
            "<input name='web_password' type='password' maxlength='31' placeholder='Zadej heslo...'>"
 
            "<input type='submit' value='💾 Uložit'></form></div>");

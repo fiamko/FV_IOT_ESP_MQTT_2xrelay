@@ -1,289 +1,187 @@
 /*
  * ============================================================================
- * relay_control.cpp — IMPLEMENTACE ŘÍZENÍ RELÉ (STAVOVÝ AUTOMAT)
+ * relay_control.cpp — CHYTRÁ REGULACE S VÝPOČTEM REZERVY (v3.1.0)
  * ============================================================================
  *
- * ÚČEL:
- *   Řízení dvou relé ohřevu vířivky podle stavového automatu.
+ * NC ZAPOJENÍ:
+ *   - Relé OFF (de-energized) = NC sepnuto = TOPÍ
+ *   - Relé ON  (energized)    = NC rozepnuto = NETOPÍ
  *
- *   STAVY:
- *     VS_OFF             — obě OFF, čeká na enabled=true
- *     VS_STARTING        — relé1 ON, za 2.5s → relé2 ON
- *     VS_ACTIVE          — obě ON, hlídá override
- *     VS_STOPPING        — relé1 OFF, za 2.5s → relé2 OFF
- *     VS_OVERRIDE_CHECK  — relé1 OFF (baterie/výkon), za 4s kontrola
+ * PRINCIP:
+ *   ESP zná aktuální odběr z baterie i výkon měniče (MQTT).
+ *   Místo "testování" dopočítá, jestli je dostatečná rezerva pro
+ *   připojení spirály — s 20% bezpečnostní marží.
  *
- *   PŘECHODY (priorita: SAFETY > OVERRIDE > MQTT_COMMAND):
- *     - OFF + enabled=true + !override → STARTING
- *     - STARTING + timer → ACTIVE
- *     - STARTING + (!enabled || override) → STOPPING
- *     - ACTIVE + !enabled → STOPPING
- *     - ACTIVE + override → OVERRIDE_CHECK
- *     - STOPPING + timer → OFF
- *     - OVERRIDE_CHECK + timer + !override + enabled → ACTIVE (obnovení)
- *     - OVERRIDE_CHECK + timer + (override || !enabled) → OFF
- *     - JAKÝKOLI STAV + MQTT timeout → OFF (okamžitě!)
+ *   spirála = power_virivka W (~1150W)
+ *   odběr spirály z bat = power_virivka / battery_voltage [A]
+ *   efektivní max = vybijeni_bat * 0.8 (20% rezerva)
+ *   volná kapacita = efektivní max - battery_discharge_current
  *
- *   BEZPEČNOST:
- *     - Bez enabled=true NIKDY nezapínat relé
- *     - Vypnout relé lze vždy (ochrana baterie/měniče)
- *     - MQTT watchdog: při výpadku delším než mqtt_timeout → okamžité OFF
+ *   Pokud volná kapacita >= odběr spirály → lze topit
+ *   Jinak → override (netopit, chránit baterii)
  *
- * VAZBY:
- *   - Čte:  g_virivka_enabled, g_virivka_state, g_menic, g_menic2,
- *           g_settings, g_last_mqtt_msg_ms
- *   - Píše: g_relay.actual[], g_relay.reason, g_virivka_state
- *   - Ovládá: GPIO RELAY1_PIN, RELAY2_PIN
+ * PRIORITY:
+ *   SAFETY (MQTT timeout) > HEADROOM > OPI_COMMAND
+ *
+ * WARMUP: 3 minuty po prvním zapnutí — override blokován
  * ============================================================================
  */
 
 #include "variables.h"
 #include "relay_control.h"
 
-// ============================================================================
-// STATICKÉ PROMĚNNÉ
-// ============================================================================
-
-// Časovač pro přechody stavového automatu
-static unsigned long s_state_timer = 0;
-
-// Příznak: probíhá safety-off (okamžité, bez prodlevy)
+static unsigned long s_warmup_start = 0;
+static bool s_warmup_active = false;
 static bool s_safety_active = false;
-static bool s_menic_stale_active = false;      // menic data timeout
 
 // ============================================================================
-// INTERNÍ FUNKCE
+// INTERNÍ
 // ============================================================================
 
-/*
- * Fyzicky nastaví stav jednoho relé (pouze při změně).
- * @param index 0=Relé1, 1=Relé2
- * @param on true=zapnout, false=vypnout
- */
-static void set_relay(int index, bool on) {
-    if (g_relay.actual[index] == on) return;  // beze změny
-
-    bool level = RELAY_ACTIVE_HIGH ? on : !on;
+static void set_relay(int index, bool topit) {
+    if (g_relay.actual[index] == topit) return;
+    bool physical = !topit;  // NC: topit = relé OFF
+    bool level = RELAY_ACTIVE_HIGH ? physical : !physical;
     int pin = (index == 0) ? RELAY1_PIN : RELAY2_PIN;
     digitalWrite(pin, level);
-    g_relay.actual[index] = on;
-
-    Serial.print(F("Relé "));
-    Serial.print(index + 1);
+    g_relay.actual[index] = topit;
+    Serial.print(F("Relé ")); Serial.print(index + 1);
     Serial.print(F(" → "));
-    Serial.println(on ? F("ON") : F("OFF"));
+    Serial.print(topit ? F("TOPÍ") : F("NETOPÍ"));
+    Serial.println();
+}
+
+static bool mqtt_timeout(unsigned long now) {
+    return (now - g_last_mqtt_msg_ms) > (g_settings.mqtt_timeout * 1000UL);
 }
 
 /*
- * Zjistí, zda je aktivní některá override podmínka.
- * - Překročení vybíjecího proudu baterie (z měniče 1)
- * - Překročení výkonu měniče 2 (pokud jsou data)
- * @return true = override aktivní, relé se nesmí zapínat / musí se vypínat
+ * Spočítá volnou kapacitu na baterii [A] a na měniči [W].
+ * Vrací true pokud je dost místa pro spirálu o výkonu spiral_w.
  */
-static RelayState::Reason check_override_reason() {
-    // Pouze pokud máme data (last_update_ms > 0)
-    if (g_menic.last_update_ms > 0) {
-        if (g_menic.battery_discharge_current > g_settings.vybijeni_bat) {
-            return RelayState::OVERRIDE_BAT;
-        }
+static bool has_headroom(float spiral_w) {
+    float bat_v = (g_menic.last_update_ms > 0) ? g_menic.battery_voltage : 25.0f;
+    if (bat_v < 1.0f) bat_v = 25.0f;
+
+    // Baterie: 20% rezerva
+    if (g_menic.last_update_ms > 0 && g_settings.vybijeni_bat > 0) {
+        float efektivni_max = g_settings.vybijeni_bat * 0.8f;
+        float spiral_bat_a = spiral_w / bat_v;
+        float volna = efektivni_max - g_menic.battery_discharge_current;
+        if (volna < spiral_bat_a) return false;
     }
-    if (g_menic2.last_update_ms > 0) {
-        if (g_menic2.output_apparent_power > g_settings.max_vykon) {
-            return RelayState::OVERRIDE_POWER;
-        }
+
+    // Měnič 2: přesně dle nastaveného maxima (měnič stavěn na plný výkon)
+    if (g_menic2.last_update_ms > 0 && g_settings.max_vykon > 0) {
+        float volna = g_settings.max_vykon - g_menic2.output_apparent_power;
+        if (volna < spiral_w) return false;
     }
-    return RelayState::NONE;
+
+    return true;
 }
 
 /*
- * Zjistí, zda vypršel MQTT watchdog.
- * @param now aktuální čas (millis)
- * @return true = timeout, má se spustit safety-off
+ * Vypočítá kolik spirál může běžet (0, 1, nebo 2).
+ * Bere v úvahu už běžící spirály.
  */
-static bool is_mqtt_timeout(unsigned long now) {
-    unsigned long elapsed = now - g_last_mqtt_msg_ms;
-    return elapsed > (g_settings.mqtt_timeout * 1000UL);
-}
+static int max_spirals_allowed() {
+    float spiral_w = SPIRALA_W;  // výkon jedné spirály
 
-static bool is_menic_timeout(unsigned long now) {
-    if (g_menic.last_update_ms == 0) return false;
-    unsigned long elapsed = now - g_menic.last_update_ms;
-    return elapsed > (MENIC_TIMEOUT_S * 1000UL);
+    // Kolik spirál už běží?
+    int running = (g_relay.actual[0] ? 1 : 0) + (g_relay.actual[1] ? 1 : 0);
+
+    // Zkus přidat další spirálu
+    float total_w = (running + 1) * spiral_w;
+    if (has_headroom(total_w)) return running + 1;
+
+    // Zkus současný počet
+    total_w = running * spiral_w;
+    if (running > 0 && has_headroom(total_w)) return running;
+
+    // Ani jedna?
+    if (has_headroom(0)) return 0;
+
+    return 0;  // nic nemůže běžet
 }
 
 // ============================================================================
-// VEŘEJNÉ FUNKCE
+// VEŘEJNÉ
 // ============================================================================
 
 void relay_control_init() {
     pinMode(RELAY1_PIN, OUTPUT);
     pinMode(RELAY2_PIN, OUTPUT);
-
-    // Výchozí stav: obě relé vypnutá (bezpečnost)
     digitalWrite(RELAY1_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     digitalWrite(RELAY2_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
-    g_relay.actual[0] = false;
-    g_relay.actual[1] = false;
+    g_relay.actual[0] = true;   // NC: TOPÍ
+    g_relay.actual[1] = true;
     g_relay.reason = RelayState::NONE;
-
-    g_virivka_state = VS_OFF;
-    g_virivka_enabled = false;
     s_safety_active = false;
-
-    Serial.println(F("Relé: inicializováno (obě OFF)."));
+    s_warmup_active = false;
+    Serial.println(F("Relé: chytrá regulace (NC, 20% rezerva)."));
 }
 
 void relay_control_loop() {
     unsigned long now = millis();
-    RelayState::Reason override_reason = check_override_reason();
-    bool override = (override_reason != RelayState::NONE);
 
-    // =====================================================================
-    // PRIORITA 1: SAFETY — MQTT timeout → okamžité vypnutí všeho
-    // =====================================================================
-    if (is_mqtt_timeout(now)) {
+    // ===== SAFETY: MQTT timeout → relé OFF = TOPÍ (bezpečné) =====
+    if (mqtt_timeout(now)) {
         if (!s_safety_active) {
-            Serial.println(F("Relé: SAFETY OFF — MQTT timeout!"));
             relay_emergency_off();
             s_safety_active = true;
-        }
-        return; // Dokud trvá safety, nic jiného neděláme
-    }
-    if (is_menic_timeout(now)) {
-        if (!s_menic_stale_active) {
-            Serial.println(F("Relé: SAFETY OFF — Vypadek dat menice!"));
-            g_relay.reason = RelayState::MENIC_STALE;
-            relay_emergency_off();
-            s_menic_stale_active = true;
+            Serial.println(F("Relé: SAFETY — MQTT timeout."));
         }
         return;
     }
+    s_safety_active = false;
 
-    // Reset safety příznaků
-    if (s_safety_active) {
-        s_safety_active = false;
-        // Důvod se nastaví v příštím průchodu stavovým automatem
-        Serial.println(F("Relé: SAFETY zrušeno — MQTT obnoveno."));
+    // ===== WARMUP =====
+    bool any_heating = g_opi_relay1 || g_opi_relay2;
+    if (any_heating && !s_warmup_active) {
+        bool was_off = !g_relay.actual[0] && !g_relay.actual[1];
+        if (was_off) {
+            s_warmup_start = now;
+            s_warmup_active = true;
+            Serial.println(F("Relé: WARMUP 3min."));
+        }
     }
-    if (s_menic_stale_active) {
-        s_menic_stale_active = false;
-        g_relay.reason = RelayState::NONE;
-        Serial.println(F("Relé: SAFETY zrušeno — data menice obnovena."));
+    if (!any_heating) s_warmup_active = false;
+    if (s_warmup_active && (now - s_warmup_start >= (WARMUP_S * 1000UL))) {
+        s_warmup_active = false;
     }
 
-    // =====================================================================
-    // STAVOVÝ AUTOMAT
-    // =====================================================================
+    // ===== VÝPOČET KOLIK SPIRÁL MŮŽE BĚŽET =====
+    int allowed = max_spirals_allowed();
 
-    switch (g_virivka_state) {
+    // OPI chce topit, ALE omezeno dostupnou kapacitou
+    bool target1 = g_opi_relay1 && (allowed >= 1);
+    bool target2 = g_opi_relay2 && (allowed >= 2);
 
-        // -----------------------------------------------------------------
-        case VS_OFF:
-            // Obě relé OFF. Přechod do STARTING pouze pokud:
-            // - OPI dalo povel enabled=true
-            // - Není aktivní override
-            // - Není safety timeout
-            if (g_virivka_enabled && !override) {
-                set_relay(0, true);          // zapni relé1
-                g_virivka_state = VS_STARTING;
-                s_state_timer = now;
-                g_relay.reason = RelayState::MQTT_ON;
-                Serial.println(F("Relé: STARTING — relé1 ON, čekám 2.5s na relé2..."));
-            } else if (g_virivka_enabled && override) {
-                // OPI chce zapnout, ale override blokuje
-                g_relay.reason = override_reason;
-            } else {
-                // OPI dalo enabled=false — normální stav v klidu
-                g_relay.reason = RelayState::MQTT_OFF;
-            }
-            break;
-
-        // -----------------------------------------------------------------
-        case VS_STARTING:
-            // Relé1 ON, relé2 OFF. Čekáme RELAY_STEP_ON_MS.
-            // Může být přerušeno: enabled=false nebo override → STOPPING
-            if (!g_virivka_enabled || override) {
-                set_relay(0, false);         // vypni relé1
-                set_relay(1, false);         // vypni i relé2 (pro jistotu)
-                g_virivka_state = VS_STOPPING;
-                s_state_timer = now;
-                g_relay.reason = override ? override_reason : RelayState::MQTT_OFF;
-                Serial.println(F("Relé: STARTING přerušeno → STOPPING."));
-            } else if (now - s_state_timer >= RELAY_STEP_ON_MS) {
-                set_relay(1, true);          // zapni relé2
-                g_virivka_state = VS_ACTIVE;
-                Serial.println(F("Relé: ACTIVE — obě relé ON, hlídám override."));
-            }
-            break;
-
-        // -----------------------------------------------------------------
-        case VS_ACTIVE:
-            // Obě relé ON. Hlídáme:
-            // - enabled=false → STOPPING (normální vypnutí)
-            // - override → OVERRIDE_CHECK (ochrana)
-            if (!g_virivka_enabled) {
-                set_relay(0, false);         // vypni relé1
-                g_virivka_state = VS_STOPPING;
-                s_state_timer = now;
-                g_relay.reason = RelayState::MQTT_OFF;
-                Serial.println(F("Relé: STOPPING — vypínám ohřev."));
-            } else if (override) {
-                set_relay(0, false);         // vypni relé1 (relé2 zatím nech)
-                g_virivka_state = VS_OVERRIDE_CHECK;
-                s_state_timer = now;
-                g_relay.reason = override_reason;
-                Serial.println(F("Relé: OVERRIDE — relé1 OFF, za 4s kontrola..."));
-            }
-            break;
-
-        // -----------------------------------------------------------------
-        case VS_STOPPING:
-            // Relé1 OFF, relé2 ještě ON. Čekáme RELAY_STEP_OFF_MS.
-            if (now - s_state_timer >= RELAY_STEP_OFF_MS) {
-                set_relay(1, false);         // vypni relé2
-                g_virivka_state = VS_OFF;
-                g_relay.reason = RelayState::MQTT_OFF;
-                Serial.println(F("Relé: OFF — obě relé vypnuta."));
-            }
-            // Během STOPPING může přijít nový enabled=true — ale necháme
-            // vypnutí dokončit. Nový STARTING přijde až v dalším cyklu z VS_OFF.
-            break;
-
-        // -----------------------------------------------------------------
-        case VS_OVERRIDE_CHECK:
-            // Relé1 OFF (kvůli override), relé2 ještě ON.
-            // Čekáme OVERRIDE_RECHECK_MS, pak zkontrolujeme podmínky.
-            if (!g_virivka_enabled) {
-                // Uživatel vypnul — dokončíme vypnutí
-                set_relay(1, false);         // vypni relé2
-                g_virivka_state = VS_OFF;
-                g_relay.reason = RelayState::MQTT_OFF;
-                Serial.println(F("Relé: OVERRIDE_CHECK → OFF (enabled=false)."));
-            } else if (now - s_state_timer >= OVERRIDE_RECHECK_MS) {
-                if (override) {
-                    // Stále překročeno → vypnout i relé2
-                    set_relay(1, false);
-                    g_virivka_state = VS_OFF;
-                    Serial.println(F("Relé: OVERRIDE — stále překročeno, obě OFF."));
-                } else {
-                    // Překročení pominulo → obnovit relé1 (relé2 běží)
-                    set_relay(0, true);
-                    g_virivka_state = VS_ACTIVE;
-                    g_relay.reason = RelayState::MQTT_ON;
-                    Serial.println(F("Relé: OVERRIDE zrušeno → ACTIVE."));
-                }
-            }
-            break;
+    // Během warmupu: ignorovat limit (topit vždy když OPI chce)
+    if (s_warmup_active) {
+        target1 = g_opi_relay1;
+        target2 = g_opi_relay2;
+        g_relay.reason = RelayState::WARMUP;
+    } else if (g_opi_relay1 && !target1) {
+        g_relay.reason = RelayState::OVERRIDE_BAT;  // nedostatek kapacity
+    } else if (g_opi_relay2 && !target2 && target1) {
+        g_relay.reason = RelayState::OVERRIDE_BAT;
+    } else if (target1 || target2) {
+        g_relay.reason = RelayState::MQTT_ON;
+    } else {
+        g_relay.reason = RelayState::MQTT_OFF;
     }
+
+    // Aplikuj
+    set_relay(0, target1);
+    set_relay(1, target2);
 }
 
 void relay_emergency_off() {
-    // Okamžité vypnutí obou relé — bezpečnostní funkce
     digitalWrite(RELAY1_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     digitalWrite(RELAY2_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
-    g_relay.actual[0] = false;
-    g_relay.actual[1] = false;
-    g_virivka_state = VS_OFF;
+    g_relay.actual[0] = true;
+    g_relay.actual[1] = true;
     g_relay.reason = RelayState::SAFETY_OFF;
     s_safety_active = true;
 }
@@ -295,7 +193,7 @@ const char* relay_reason_str() {
         case RelayState::OVERRIDE_POWER: return "Pretizeny menic";
         case RelayState::OVERRIDE_BAT:   return "Zatez baterie";
         case RelayState::SAFETY_OFF:     return "Ztrata spojeni";
-        case RelayState::MENIC_STALE:    return "Vypadek dat menice";
+        case RelayState::WARMUP:         return "Nabeh virivky";
         default:                         return "Inicializace...";
     }
 }

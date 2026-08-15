@@ -64,15 +64,18 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
-    // Topic: fve/spotrebice/virivka/set — povel ON/OFF z OPI
+    // Topic: fve/spotrebice/virivka/set — povel z OPI: {"relay1":0/1,"relay2":0/1}
     if (strcmp(topic, MQTT_TOPIC_VIRIVKA_CMD) == 0) {
-        if (s_json_doc.containsKey(JSON_ENABLED)) {
-            g_virivka_enabled = s_json_doc[JSON_ENABLED].as<bool>();
-            Serial.print(F("MQTT: virivka enabled = "));
-            Serial.println(g_virivka_enabled ? F("true (ZAP)") : F("false (OFF)"));
-        } else {
-            Serial.println(F("MQTT: varování — klíč 'enabled' nenalezen!"));
+        if (s_json_doc.containsKey("relay1")) {
+            g_opi_relay1 = s_json_doc["relay1"].as<bool>();
         }
+        if (s_json_doc.containsKey("relay2")) {
+            g_opi_relay2 = s_json_doc["relay2"].as<bool>();
+        }
+        Serial.print(F("MQTT: virivka relay1="));
+        Serial.print(g_opi_relay1);
+        Serial.print(F(" relay2="));
+        Serial.println(g_opi_relay2);
     }
 
     // Topic: menic/1/data — data z měniče 1 (baterie, výkon)
@@ -82,6 +85,9 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
         if (s_json_doc.containsKey(JSON_BAT_VYBIJENI)) {
             g_menic.battery_discharge_current = s_json_doc[JSON_BAT_VYBIJENI].as<float>();
+        }
+        if (s_json_doc.containsKey("battery_voltage")) {
+            g_menic.battery_voltage = s_json_doc["battery_voltage"].as<float>();
         }
         g_menic.last_update_ms = millis();
 
@@ -210,8 +216,9 @@ void mqtt_publish_status() {
     s_json_doc[JSON_STATUS]  = any_on ? "ZAP" : "OFF";
     s_json_doc[JSON_VYSTUP1] = g_relay.actual[0] ? 1 : 0;
     s_json_doc[JSON_VYSTUP2] = g_relay.actual[1] ? 1 : 0;
-    s_json_doc[JSON_PROUD]   = g_sensors.proud;
-    s_json_doc[JSON_TEPLOTA] = g_sensors.teplota;
+    // Zaokrouhleno na 2 desetinná místa
+    s_json_doc[JSON_PROUD]   = roundf(g_sensors.proud * 100.0f) / 100.0f;
+    s_json_doc[JSON_TEPLOTA] = roundf(g_sensors.teplota * 100.0f) / 100.0f;
 
     String msg;
     serializeJson(s_json_doc, msg);

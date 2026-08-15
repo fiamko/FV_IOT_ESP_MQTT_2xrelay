@@ -8,6 +8,7 @@
 #include "wifi_manager.h"
 #include <DNSServer.h>
 #include <WebServer.h>
+#include <esp_task_wdt.h>
 
 // ============================================================================
 // STATICKÉ PROMĚNNÉ MODULU
@@ -97,6 +98,8 @@ static bool connect_wifi(const char* ssid, const char* password) {
     Serial.print(F("WiFi: připojuji k "));
     Serial.println(ssid);
 
+    WiFi.disconnect(true);  // odpoj předchozí pokus (fix pro dual-SSID)
+    delay(200);
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
 
@@ -215,6 +218,9 @@ static void handle_captive_portal() {
 // ============================================================================
 
 void wifi_start_config_portal() {
+    // Vypnout task watchdog — stejně jako u OTA (konfigurace může trvat déle)
+    esp_task_wdt_delete(NULL);
+
     Serial.println(F("WiFi: spouštím konfigurační režim..."));
     g_wifi_config_mode = true;
 

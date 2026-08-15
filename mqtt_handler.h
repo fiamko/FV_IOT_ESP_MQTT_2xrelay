@@ -13,7 +13,7 @@
  * VAZBY:
  *   - Používá: g_mqtt (PubSubClient), g_wifi_client (WiFiClient)
  *   - Čte: g_sensors (data k publikování), g_relay (aktuální stav)
- *   - Zapisuje: g_virivka_enabled, g_menic, g_menic2, g_mqtt_connected, g_last_mqtt_msg_ms
+ *   - Zapisuje: g_opi_relay1, g_opi_relay2, g_menic, g_menic2, g_mqtt_connected, g_last_mqtt_msg_ms
  *   - Voláno z: loop() v hlavním .ino
  * ============================================================================
  */

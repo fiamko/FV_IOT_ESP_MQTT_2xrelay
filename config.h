@@ -22,7 +22,7 @@
 // ============================================================================
 // VERZE FIRMWARU
 // ============================================================================
-#define FIRMWARE_VERSION "2.0.1"
+#define FIRMWARE_VERSION "3.0.0"
 
 // ============================================================================
 // GPIO PINY — OVĚŘENO TESTOVACÍM PROGRAMEM 17.7.2026
@@ -91,7 +91,7 @@
 // ============================================================================
 #define WEB_PORT          80
 #define WEB_USERNAME      "admin"
-#define DEFAULT_WEB_PASS   "zmenit"   // výchozí heslo — změň na webu!
+#define DEFAULT_WEB_PASS  "2330"      // výchozí heslo
 
 // ============================================================================
 // ČASOVÁNÍ (ms)
@@ -101,10 +101,9 @@
 #define STATUS_PUBLISH_MS       5000    // interval publikování stavu do MQTT (4-5s)
 #define BUTTON_LONG_PRESS_MS    5000    // doba pro spuštění WiFi portálu tlačítkem
 
-// Časování relé — stavový automat
-#define RELAY_STEP_ON_MS        2500    // prodleva mezi zapnutím relé1 a relé2
-#define RELAY_STEP_OFF_MS       2500    // prodleva mezi vypnutím relé1 a relé2
-#define OVERRIDE_RECHECK_MS     4000    // čekání po vypnutí relé1 při override, než se zkontroluje stav
+// Časování relé — stavový automat (NC zapojení)
+#define WARMUP_S                180     // [s]  po startu topení ignorovat override (3min — diagnostika vířivky)
+#define SPIRALA_W               1000    // [W]  výkon jedné spirály (2×1000W + 300W čerpadlo = 2300W celkem)
 
 // ============================================================================
 // ADC — SCT013 20A/1V kalibrace

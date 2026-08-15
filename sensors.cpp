@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ============================================================================
  * sensors.cpp — IMPLEMENTACE ČTENÍ SENZORŮ (DS18B20 + SCT013)
  * ============================================================================
@@ -102,11 +102,11 @@ void sensors_init() {
             g_dallas.begin();
             s_ds18b20_valid = true;
             g_sensors.teplota_error = false;
-            Serial.println(F("DS18B20: čidlo potvrzeno (uložená adresa)."));
+            Serial.println(F("DS18B20: čidlo potvrzeno (ulozená adresa)."));
         } else {
             // Adresa uložena, ale čidlo neodpovídá
             g_dallas.begin();
-            Serial.println(F("DS18B20: uložená adresa — čidlo NEnalezeno!"));
+            Serial.println(F("DS18B20: ulozená adresa — čidlo Nenalezeno!"));
             Serial.println(F("DS18B20: spusťte 'scan' v Serial Monitoru pro nové vyhledání."));
             g_sensors.teplota_error = true;
         }

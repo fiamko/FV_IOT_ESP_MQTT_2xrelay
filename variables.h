@@ -30,37 +30,8 @@
 #include "config.h"
 
 // ============================================================================
-// STAVOVÝ AUTOMAT OHŘEVU
+// OPI-DIRECT ŘÍZENÍ — OPI posílá {"relay1":0/1,"relay2":0/1}
 // ============================================================================
-
-/*
- * Stavy řízení ohřevu vířivky.
- *
- * VS_OFF             — obě relé OFF, čeká na enabled=true z OPI
- * VS_STARTING        — relé1 ON, čeká RELAY_STEP_ON_MS, pak zapne relé2
- * VS_ACTIVE          — obě relé ON, hlídá override podmínky
- * VS_STOPPING        — relé1 OFF, čeká RELAY_STEP_OFF_MS, pak vypne relé2
- * VS_OVERRIDE_CHECK  — relé1 OFF (kvůli override), čeká OVERRIDE_RECHECK_MS,
- *                       pak zkontroluje podmínky: OK → ACTIVE, stále špatné → OFF
- *
- * Přechody:
- *   OFF → STARTING:       enabled=true && !override && !safety
- *   STARTING → ACTIVE:    timer RELAY_STEP_ON_MS vypršel
- *   STARTING → STOPPING:  enabled=false || override
- *   ACTIVE → STOPPING:    enabled=false
- *   ACTIVE → OVERRIDE_CHECK: override (baterie nebo výkon)
- *   STOPPING → OFF:       timer RELAY_STEP_OFF_MS vypršel
- *   OVERRIDE_CHECK → ACTIVE: timer vypršel && !override && enabled=true
- *   OVERRIDE_CHECK → OFF: timer vypršel && (override || enabled=false)
- *   JAKÝKOLI STAV → OFF:  MQTT timeout (safety) — okamžité vypnutí obou relé
- */
-enum VirivkaState {
-    VS_OFF,
-    VS_STARTING,
-    VS_ACTIVE,
-    VS_STOPPING,
-    VS_OVERRIDE_CHECK
-};
 
 // ============================================================================
 // STRUKTURY
@@ -72,12 +43,12 @@ enum VirivkaState {
  */
 struct RelayState {
     // [ZAPISUJE: relay_control] [ČTE: mqtt_handler, web_setup]
-    // Skutečný fyzický stav relé (po vyhodnocení všech override)
+    // Stav TOPENÍ — true = topí (NC: fyzické relé OFF), false = netopí
     bool actual[2];
 
     // [ZAPISUJE: relay_control] [ČTE: web_setup]
     // Důvod poslední změny — pro diagnostiku
-    enum Reason { NONE, MQTT_ON, MQTT_OFF, OVERRIDE_POWER, OVERRIDE_BAT, SAFETY_OFF, MENIC_STALE } reason;
+    enum Reason { NONE, MQTT_ON, MQTT_OFF, OVERRIDE_POWER, OVERRIDE_BAT, SAFETY_OFF, WARMUP } reason;
 };
 
 /*
@@ -103,15 +74,15 @@ struct SensorData {
  */
 struct MenicData {
     // [ZAPISUJE: mqtt_handler] [ČTE: relay_control, web_setup] [W]
-    // Zdánlivý výkon měniče — pro ochranu proti přetížení
     float output_apparent_power;
 
     // [ZAPISUJE: mqtt_handler] [ČTE: relay_control, web_setup] [A]
-    // Vybíjecí proud baterie — pro ochranu proti nadměrnému vybíjení
     float battery_discharge_current;
 
+    // [ZAPISUJE: mqtt_handler] [ČTE: relay_control] [V]
+    float battery_voltage;
+
     // [ZAPISUJE: mqtt_handler] [ČTE: relay_control]
-    // Čas posledního příjmu dat z měniče (millis) — pro watchdog
     unsigned long last_update_ms;
 };
 
@@ -172,13 +143,10 @@ extern Settings    g_settings;         // uživatelské nastavení
 // GLOBÁLNÍ STAVOVÉ PROMĚNNÉ
 // ============================================================================
 
-// [ZAPISUJE: relay_control] [ČTE: mqtt_handler, web_setup, relay_control]
-// Aktuální stav automatu ohřevu vířivky
-extern VirivkaState g_virivka_state;
-
 // [ZAPISUJE: mqtt_handler] [ČTE: relay_control, web_setup]
-// Povel z OPI: true = zapnout ohřev, false = vypnout
-extern bool g_virivka_enabled;
+// Povel z OPI pro jednotlivá relé
+extern bool g_opi_relay1;
+extern bool g_opi_relay2;
 
 // [ZAPISUJE: mqtt_handler] [ČTE: relay_control, web_setup]
 // true = MQTT je připojeno, false = výpadek

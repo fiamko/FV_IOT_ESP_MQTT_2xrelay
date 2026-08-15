@@ -70,8 +70,8 @@ MenicData   g_menic;              // data z měniče 1 (baterie)
 MenicData   g_menic2;             // data z měniče 2 (výkon pro vířivku)
 Settings    g_settings;           // uživatelské nastavení
 
-VirivkaState g_virivka_state = VS_OFF;  // stavový automat ohřevu
-bool         g_virivka_enabled = false;  // povel z OPI
+bool         g_opi_relay1 = false;       // OPI povel: relé 1
+bool         g_opi_relay2 = false;       // OPI povel: relé 2
 
 bool         g_mqtt_connected = false;
 unsigned long g_last_mqtt_msg_ms = 0;
@@ -117,6 +117,9 @@ static void load_settings() {
 // ============================================================================
 
 void setup() {
+    // Vypnout defaultní task watchdog (5s) — setup může trvat déle
+    esp_task_wdt_delete(NULL);
+
     Serial.begin(115200);
     delay(1000);
 
@@ -145,16 +148,22 @@ void setup() {
         // 5a. OTA
         ArduinoOTA.setHostname("ESP32-virivka");
         ArduinoOTA.onStart([]() {
-            Serial.println(F("OTA: začínám update..."));
+            // Během OTA deaktivujeme task watchdog — flash zápis blokuje loop >10s
+            esp_task_wdt_delete(NULL);
+            Serial.println(F("OTA: začínám update... (WDT off)"));
         });
         ArduinoOTA.onEnd([]() {
-            Serial.println(F("OTA: update dokončen."));
+            // Po OTA obnovíme task watchdog
+            esp_task_wdt_add(NULL);
+            Serial.println(F("OTA: update dokončen. (WDT on)"));
         });
         ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
             Serial.printf("OTA: %u%%\r", (progress * 100) / total);
         });
         ArduinoOTA.onError([](ota_error_t error) {
-            Serial.printf("OTA error: %u\n", error);
+            // I při chybě obnovit watchdog!
+            esp_task_wdt_add(NULL);
+            Serial.printf("OTA error: %u (WDT restored)\n", error);
         });
         ArduinoOTA.begin();
         Serial.println(F("OTA: připraveno."));
@@ -166,8 +175,8 @@ void setup() {
         web_setup_init();
     }
 
-    // 5. HW watchdog — restart ESP32 při zamrznutí (10s timeout)
-    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 10000, .trigger_panic = true };
+    // 5. HW watchdog — restart ESP32 při zamrznutí (30s timeout, OTA-safe)
+    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .trigger_panic = true };
     esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
 
@@ -192,6 +201,7 @@ void loop() {
 
     // 2. OTA — musí běžet vždy, když je WiFi
     if (WiFi.isConnected()) {
+        esp_task_wdt_reset();  // krmení psa před OTA (může blokovat)
         ArduinoOTA.handle();
     }
 
@@ -223,8 +233,8 @@ void loop() {
             Serial.println(F("--- STATUS ---"));
             Serial.print(F("WiFi: ")); Serial.println(WiFi.isConnected() ? F("OK") : F("OFF"));
             Serial.print(F("MQTT: ")); Serial.println(g_mqtt_connected ? F("OK") : F("OFF"));
-            Serial.print(F("Virivka: ")); Serial.print(g_virivka_enabled ? F("ZAP") : F("OFF"));
-            Serial.print(F("  stav=")); Serial.println(g_virivka_state);
+            Serial.print(F("Virivka: R1=")); Serial.print(g_opi_relay1);
+            Serial.print(F(" R2=")); Serial.println(g_opi_relay2);
             Serial.print(F("R1=")); Serial.print(g_relay.actual[0]);
             Serial.print(F(" R2=")); Serial.println(g_relay.actual[1]);
             Serial.print(F("Proud: ")); Serial.print(g_sensors.proud, 2); Serial.println(F(" A"));
