@@ -120,8 +120,11 @@ static String generate_html(const char* message = nullptr) {
     h += String(g_settings.override_delay);
     h += F("'>"
 
-           "<label>Web heslo:</label>"
-           "<input name='web_password' type='password' maxlength='31' placeholder='Zadej heslo...'>"
+            "<label>Web heslo:</label>"
+            "<input name='web_password' type='password' maxlength='31' placeholder='Zadej heslo...'>"
+
+            "<label>Nové heslo (nepovinné):</label>"
+            "<input name='new_password' type='password' maxlength='31' placeholder='Prázdné = beze změny...'>"
 
            "<input type='submit' value='💾 Uložit'></form></div>");
 
@@ -211,9 +214,12 @@ static void handle_save() {
         g_settings.override_delay = s_web_server->arg("override_delay").toInt();
         g_prefs.putInt("override_dly", g_settings.override_delay);
     }
-    if (s_web_server->hasArg("web_password") && password.length() > 0) {
-        strncpy(g_settings.web_password, password.c_str(), 31);
-        g_prefs.putString("web_pass", password);
+    if (s_web_server->hasArg("new_password")) {
+        String new_password = s_web_server->arg("new_password");
+        if (new_password.length() > 0) {
+            strncpy(g_settings.web_password, new_password.c_str(), 31);
+            g_prefs.putString("web_pass", new_password);
+        }
     }
 
     g_prefs.putString("fw_ver", FIRMWARE_VERSION);
