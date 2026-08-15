@@ -91,7 +91,12 @@
 // ============================================================================
 #define WEB_PORT          80
 #define WEB_USERNAME      "admin"
-#define DEFAULT_WEB_PASS  "2330"      // výchozí heslo
+// Heslo se nacte ze secrets.h (gitignorovany). Bez nej fallback na sablonu.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #include "secrets.example.h"
+#endif
 
 // ============================================================================
 // ČASOVÁNÍ (ms)

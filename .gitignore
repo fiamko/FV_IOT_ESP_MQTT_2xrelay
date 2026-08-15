@@ -11,3 +11,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets (heslo webu) — NIKDY necommitovat!
+secrets.h
